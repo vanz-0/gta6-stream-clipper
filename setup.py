@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-setup.py - One-click environment bootstrap for GTA 6 Stream Clipper
-Verifies FFmpeg, installs Python packages, and downloads Whisper model.
+setup.py - Environment Bootstrap for GTA 6 Stream Shorts Clipper
+Verifies FFmpeg, installs Python dependencies, and downloads the YuNet face detection model.
 """
 
 import os
@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parent
 MODELS_DIR = ROOT / "models"
 BIN_DIR = ROOT / "bin"
 
-WHISPER_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin"
+YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 
 def run_cmd(cmd):
     return subprocess.run(cmd, check=True)
@@ -36,27 +36,27 @@ def check_binaries():
     else:
         print("   ✓ ffmpeg detected.")
 
-def download_model():
+def download_models():
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    target = MODELS_DIR / "ggml-small.en.bin"
-    if target.exists() and target.stat().st_size > 100_000_000:
-        print(f"   ✓ Whisper model already present ({target.stat().st_size / 1e6:.1f} MB).")
+    target = MODELS_DIR / "face_detection_yunet_2023mar.onnx"
+    if target.exists() and target.stat().st_size > 100_000:
+        print(f"   ✓ YuNet Facecam model already present ({target.stat().st_size / 1e6:.2f} MB).")
         return
 
-    # Check parent workspace cache if running inside clone
-    parent_cache = ROOT.parent / ".niche-machine" / "models" / "ggml-small.en.bin"
-    if parent_cache.exists():
-        print("   ✓ Copying Whisper model from existing cache...")
-        shutil.copy(parent_cache, target)
+    # Check local machine cache if available
+    local_cache = Path("c:/AI OS/execution/models/face_detection_yunet_2023mar.onnx")
+    if local_cache.exists():
+        print("   ✓ Copying YuNet model from local cache...")
+        shutil.copy(local_cache, target)
         return
 
-    print("📥 Downloading Whisper small.en model (~487 MB)...")
+    print("📥 Downloading YuNet face detection model...")
     try:
-        urllib.request.urlretrieve(WHISPER_URL, target)
-        print("   ✓ Whisper model downloaded.")
+        urllib.request.urlretrieve(YUNET_URL, target)
+        print("   ✓ YuNet model downloaded.")
     except Exception as e:
         print(f"   ⚠️ Could not automatically download model: {e}")
-        print(f"      Download manually from: {WHISPER_URL}")
+        print(f"      Download manually from: {YUNET_URL}")
         print(f"      and save to: {target}")
 
 def main():
@@ -65,7 +65,7 @@ def main():
     print("=" * 60)
     check_python_packages()
     check_binaries()
-    download_model()
+    download_models()
     print("\n🎉 Setup complete! You are ready to clip.")
     print("   Run: python clipper.py --help\n")
 

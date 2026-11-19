@@ -1,19 +1,21 @@
-# Stream Shorts Clipper
+# GTA 6 & Gaming Stream Shorts Clipper
 
-An automated open-source pipeline to convert long gameplay live streams into high-retention 9:16 vertical Shorts, TikToks, and Reels.
+An automated AI-powered pipeline to turn long gameplay live streams and VODs into high-retention 9:16 vertical Shorts, TikToks, and Reels.
 
 ---
 
-## Highlights
+## What's New & Highlights
 
-- **Smart Video Layouts**:
-  - `facecam`: Dynamic split screen with gameplay on top and streamer reaction on the bottom.
-  - `blur`: Blurred background fill with full-frame gameplay centered in 9:16.
-- **Whisper AI Subtitles**: Word-by-word timestamp generation for animated subtitles.
-- **Dynamic Karaoke Highlighting**: Active spoken words highlighted in bright yellow with black stroke outlines.
-- **Built-in Swear Filter**: Automatic tracking and censoring of profanities across subtitles, hook badges, and post descriptions using `*`.
-- **EBU R128 Audio Normalization**: Automatic `loudnorm` filter balancing audio levels for social feed playback.
-- **Complete Post Kits**: Automatically generates the vertical MP4 video, cover thumbnail image, social caption text file, and JSON metadata.
+- **AI Gamer-Checkup System**: Uses multi-frame spatial clustering with OpenCV YuNet to lock onto the seated streamer with headphones and chair, rejecting in-game characters and cutscene faces to eliminate duplicated gameplay.
+- **Auto-Switching Layouts**:
+  - `auto` (Default): Automatically verifies if a streamer cam is present. If found, renders a 60/40 split (gameplay top, streamer bottom); if not found, falls back cleanly to a single-panel gameplay reel without fake boxes.
+  - `facecam`: Enforces split screen mode.
+  - `blur`: Enforces single-panel gameplay over a 30px blurred background.
+- **Faster-Whisper AI Subtitles**: Ultra-fast local transcription with word-level timestamps.
+- **Dynamic Sabs Subtitles**: High-impact 3-word cadence with vibrant yellow (`#FFDE00`) active word highlighting and black outlines.
+- **Built-in Swear Filter**: Automatically censors profanities (`f**k`, `sh*t`, `b*tch`, etc.) to protect your posts from platform shadowbans or demonetization.
+- **EBU R128 Broadcast Audio Normalization**: Applies `-14 LUFS` loudness normalization for crystal-clear mobile playback.
+- **Complete Post Kits**: Generates the 1080×1920 MP4, cover thumbnail JPG, social caption text file, and JSON metadata with zero intermediate file bloat.
 
 ---
 
@@ -21,29 +23,29 @@ An automated open-source pipeline to convert long gameplay live streams into hig
 
 ```
                       Stream URL / Video File
-                                |
-                   [yt-dlp Section Extractor]
-                                |
-             +------------------+------------------+
-             |                                     |
-       [Audio Track]                         [Video Track]
-             |                                     |
-    [Whisper AI Engine]                     [Layout Mode]
-             |                              /           \
-  [Word Timestamps & Tokens]       [Blur Vertical]  [Split Facecam]
-             |                               \         /
-   [Profanity Filter (*)]                     [Base Canvas]
-             |                                     |
- [Karaoke PNG Frame Generator]                     |
-             |                                     |
-             +------------------+------------------+
-                                |
-                    [FFmpeg Filter Complex]
-                                |
-                    +-----------+-----------+
-                    |                       |
-               [Video MP4]             [Cover JPG]
-               [Post TXT]              [Meta JSON]
+                                 |
+                    [yt-dlp Section Extractor]
+                                 |
+              +------------------+------------------+
+              |                                     |
+        [Audio Track]                         [Video Track]
+              |                                     |
+    [Faster-Whisper AI]                    [Gamer-Checkup]
+              |                         (YuNet Spatial Cluster)
+   [Word Timestamps & Tokens]                       |
+              |                        Verified / Not Detected?
+    [Swear Filter (*)]                         /        \
+              |                      [60/40 Split]   [Single Gameplay]
+   [ASS Sabs Subtitles]                        \        /
+              |                           [1080x1920 9:16]
+              +------------------+------------------+
+                                 |
+                     [FFmpeg Filter Complex]
+                                 |
+                     +-----------+-----------+
+                     |                       |
+                [Video MP4]             [Cover JPG]
+                [Post TXT]              [Meta JSON]
 ```
 
 ---
@@ -53,7 +55,7 @@ An automated open-source pipeline to convert long gameplay live streams into hig
 ### 1. Requirements
 
 - Python 3.10+
-- FFmpeg installed and available on system PATH
+- FFmpeg installed and available on system PATH (or in `bin/`)
 - Git
 
 ### 2. Installation
@@ -66,28 +68,32 @@ cd gta6-stream-clipper
 python setup.py
 ```
 
-The setup script automatically installs necessary Python packages and configures the Whisper speech model.
+The setup script verifies FFmpeg, installs Python dependencies, and downloads the YuNet face detection ONNX model.
 
 ---
 
-## Usage
+## Usage Examples
 
-### Clip Directly from a Stream URL
+### 1. Clip Directly from a Stream URL
 
 ```bash
-python clipper.py --url "https://www.youtube.com/watch?v=EXAMPLE" --ss 30 --dur 25 --hook "UNREAL MOMENT"
+python clipper.py --url "https://www.youtube.com/watch?v=EXAMPLE" --ss 120 --dur 25 --hook "UNREAL MOMENT!!"
 ```
 
-### Clip from a Local File
+### 2. Clip from a Local File
 
 ```bash
-python clipper.py --file "gameplay.mp4" --ss 60 --dur 30 --layout blur --hook "HE COULD NOT BELIEVE THIS"
+python clipper.py --file "stream_vod.mp4" --ss 450 --dur 25 --hook "THE GRAPHICS ARE UNREAL!!"
 ```
 
-### Split-Screen Facecam Mode
+### 3. Force Specific Layout Mode
 
 ```bash
-python clipper.py --file "stream.mp4" --ss 120 --dur 35 --layout facecam --hook "INSANE REACTION"
+# Force single-panel gameplay over blurred background:
+python clipper.py --file "gameplay.mp4" --ss 765 --dur 25 --layout blur --hook "FIRST CAR THEFT!!"
+
+# Force split-screen facecam mode:
+python clipper.py --url "https://www.youtube.com/watch?v=EXAMPLE" --ss 3680 --dur 25 --layout facecam --hook "FIRST PERSON MODE!!"
 ```
 
 ---
@@ -100,27 +106,12 @@ python clipper.py --file "stream.mp4" --ss 120 --dur 35 --layout facecam --hook 
 | `--file` | string | `None` | Local video file path |
 | `--ss` | float | `0.0` | Start offset time in seconds |
 | `--dur` | float | `25.0` | Duration of the clip in seconds |
-| `--hook` | string | `"VIRAL MOMENT"` | Hook title displayed on badge |
-| `--layout` | string | `blur` | Layout mode: `blur` or `facecam` |
-| `--no-censor` | flag | `False` | Disable automatic profanity censoring |
-| `--output` | string | `output/` | Destination folder for export files |
-
----
-
-## YouTube Description Snippet
-
-If you share this workflow with your audience, you can paste this into your video description:
-
-```text
-Download the free open-source Stream Clipper tool here:
-https://github.com/vanz-0/gta6-stream-clipper
-
-Features:
-- Automated 9:16 Shorts converter
-- Split screen facecam + gameplay
-- AI word-by-word karaoke subtitles
-- Built-in swear filter and audio normalization
-```
+| `--hook` | string | `"GTA 6 IS ACTUALLY INSANE!!"` | Hook title badge text |
+| `--slug` | string | `"gta6_viral_short"` | Output filename prefix |
+| `--caption` | string | `None` | Custom social media caption |
+| `--layout` | string | `auto` | Layout mode: `auto`, `facecam`, or `blur` |
+| `--no-censor` | flag | `False` | Disable automatic swear word censoring |
+| `--output` | string | `output/<date>/` | Destination folder for export files |
 
 ---
 
