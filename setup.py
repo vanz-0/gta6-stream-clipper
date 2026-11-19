@@ -29,6 +29,24 @@ def check_binaries():
     print("🔍 Checking system binaries...")
     ffmpeg_ok = shutil.which("ffmpeg") or (BIN_DIR / ("ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg")).exists()
     if not ffmpeg_ok:
+        # Check common Windows locations
+        win_candidates = [
+            Path("C:/Program Files/ffmpeg/bin/ffmpeg.exe"),
+            Path("C:/ffmpeg/bin/ffmpeg.exe"),
+            ROOT.parent / ".agents" / "skills" / "niche-machine" / "bin" / "ffmpeg.exe",
+        ]
+        for c in win_candidates:
+            if c.exists():
+                BIN_DIR.mkdir(parents=True, exist_ok=True)
+                shutil.copy(c, BIN_DIR / "ffmpeg.exe")
+                ffprobe_c = c.with_name("ffprobe.exe")
+                if ffprobe_c.exists():
+                    shutil.copy(ffprobe_c, BIN_DIR / "ffprobe.exe")
+                print(f"   ✓ Copied local ffmpeg from {c}")
+                ffmpeg_ok = True
+                break
+
+    if not ffmpeg_ok:
         print("   ⚠️ ffmpeg was not found on your PATH or in bin/.")
         print("      Windows: winget install Gyan.FFmpeg or download from https://ffmpeg.org")
         print("      macOS  : brew install ffmpeg")
@@ -44,11 +62,15 @@ def download_models():
         return
 
     # Check local machine cache if available
-    local_cache = Path("c:/AI OS/execution/models/face_detection_yunet_2023mar.onnx")
-    if local_cache.exists():
-        print("   ✓ Copying YuNet model from local cache...")
-        shutil.copy(local_cache, target)
-        return
+    cache_candidates = [
+        ROOT.parent / "models" / "face_detection_yunet_2023mar.onnx",
+        Path.home() / ".niche-machine" / "models" / "face_detection_yunet_2023mar.onnx",
+    ]
+    for cache in cache_candidates:
+        if cache.exists():
+            print(f"   ✓ Copying YuNet model from {cache}...")
+            shutil.copy(cache, target)
+            return
 
     print("📥 Downloading YuNet face detection model...")
     try:

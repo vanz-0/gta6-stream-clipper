@@ -8,9 +8,9 @@ Features:
     rejecting in-game characters and UI photos to prevent duplicate video issues.
   - Smart Floating Layout: Gameplay (60%) on top, Streamer (40%) on bottom, floating
     over a 30px blurred + darkened source background.
-  - Faster-Whisper AI Subtitles: Word-level timestamps with high-performance ASS formatting.
+  - Multi-Backend AI Subtitles: Faster-Whisper with automatic fallback to Whisper-CLI.
   - Dynamic Sabs: 3-word cadence with bright yellow (#FFDE00) active word highlighting.
-  - Built-in Swear Filter: Automatic tracking and censoring of profanities (f**k, sh*t, etc.).
+  - Built-in Swear Filter: Automatic tracking and censoring of profanities (f*****g, b***h, etc.).
   - EBU R128 Audio Normalization: Balanced audio levels for social feed playback.
   - Complete Post Kit: Vertical MP4 (1080x1920, 9:16), Cover JPG, TXT Post Kit, JSON Metadata.
 """
@@ -33,23 +33,59 @@ except ImportError:
     def clean(t): return t
     def has_swears(t): return False
 
-# ─── PATHS & BINARY RESOLUTION ────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).resolve().parent
 
+# ─── BINARY RESOLUTION ────────────────────────────────────────────────────────
 def find_binary(name: str) -> str:
-    """Finds binary in local bin/, system PATH, or common locations."""
+    """Finds binary in local bin/, parent toolkits, system PATH, or common locations."""
     ext = ".exe" if sys.platform.startswith("win") else ""
+    
+    # 1. Local bin folder
     local_bin = SCRIPT_DIR / "bin" / f"{name}{ext}"
     if local_bin.exists():
         return str(local_bin)
+    
+    # 2. Parent toolkit / agent bins
+    search_dirs = [
+        SCRIPT_DIR.parent / ".agents" / "skills" / "niche-machine" / "bin",
+        SCRIPT_DIR.parent / "bin",
+        Path.home() / ".niche-machine" / "bin",
+        Path("C:/Program Files/ffmpeg/bin"),
+        Path("C:/ffmpeg/bin"),
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Packages"
+    ]
+    for d in search_dirs:
+        candidate = d / f"{name}{ext}"
+        if candidate.exists():
+            return str(candidate)
+        # Search winget subdirs
+        if d.exists() and "WinGet" in str(d):
+            found = list(d.glob(f"**/{name}{ext}"))
+            if found:
+                return str(found[0])
+
+    # 3. System PATH
     found = shutil.which(name)
     if found:
         return found
+        
     return name
 
 FFMPEG_BIN  = find_binary("ffmpeg")
 FFPROBE_BIN = find_binary("ffprobe")
+WHISPER_BIN = find_binary("whisper-cli")
 YUNET_MODEL = SCRIPT_DIR / "models" / "face_detection_yunet_2023mar.onnx"
+
+def get_whisper_cli_model() -> Path:
+    candidates = [
+        SCRIPT_DIR / "models" / "ggml-small.en.bin",
+        SCRIPT_DIR.parent / ".niche-machine" / "models" / "ggml-small.en.bin",
+        Path.home() / ".niche-machine" / "models" / "ggml-small.en.bin",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[0]
 
 # Canvas dimensions
 CANVAS_W      = 1080
@@ -67,17 +103,19 @@ SUB_SEAM_Y    = SEAM_Y - 12                   # = 1108
 SUB_SINGLE_Y  = CONTENT_Y + CONTENT_H - 220  # = 1540
 
 # ─── FONT SELECTION ───────────────────────────────────────────────────────────
-def get_font_path() -> Path:
+def get_font_path():
     candidates = [
         Path("C:/Windows/Fonts/ariblk.ttf"),
         Path("C:/Windows/Fonts/arialbd.ttf"),
+        Path("C:/Windows/Fonts/arial.ttf"),
         Path("/System/Library/Fonts/Supplemental/Arial Black.ttf"),
         Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+        Path("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"),
     ]
     for p in candidates:
         if p.exists():
             return p
-    return Path("C:/Windows/Fonts/arial.ttf")
+    return None
 
 FONT_PATH = get_font_path()
 
@@ -86,19 +124,44 @@ def log(msg): print(msg, flush=True)
 
 def run_cmd(cmd, **kwargs):
     cmd = [str(c) for c in cmd]
-    res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", **kwargs)
-    if res.returncode != 0:
-        err = res.stderr[-500:] if res.stderr else "Unknown error"
-        raise RuntimeError(f"Command failed ({cmd[0]}): {err}")
-    return res
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", **kwargs)
+        if res.returncode != 0:
+            err = res.stderr[-500:] if res.stderr else "Unknown error"
+            raise RuntimeError(f"Command failed ({cmd[0]}): {err}")
+        return res
+    except FileNotFoundError:
+        binary = cmd[0]
+        raise RuntimeError(
+            f"Executable '{binary}' not found!\n"
+            f"Please run 'python setup.py' or ensure FFmpeg is installed and added to your system PATH."
+        )
 
 def get_source_dimensions(video_path):
-    out = subprocess.check_output(
-        [FFPROBE_BIN, "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=width,height", "-of", "json", str(video_path)],
-        stderr=subprocess.DEVNULL)
-    s = json.loads(out)["streams"][0]
-    return int(s["width"]), int(s["height"])
+    """Retrieves width and height via ffprobe with OpenCV fallback."""
+    try:
+        out = subprocess.check_output(
+            [FFPROBE_BIN, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "json", str(video_path)],
+            stderr=subprocess.DEVNULL)
+        s = json.loads(out)["streams"][0]
+        return int(s["width"]), int(s["height"])
+    except Exception:
+        pass
+
+    # OpenCV fallback
+    try:
+        import cv2
+        cap = cv2.VideoCapture(str(video_path))
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        if w > 0 and h > 0:
+            return w, h
+    except Exception:
+        pass
+
+    return 1920, 1080
 
 # ─── STEP 1: DOWNLOAD STREAM SECTION ──────────────────────────────────────────
 def download_stream_section(url: str, ss: float, dur: float, out_file: Path) -> Path:
@@ -113,11 +176,14 @@ def download_stream_section(url: str, ss: float, dur: float, out_file: Path) -> 
         "-f", "bv*[height<=1080][fps<=60]+ba/b[height<=1080]/bv*+ba/b",
         "--download-sections", f"*{t_start:.1f}-{t_end:.1f}",
         "--merge-output-format", "mp4",
-        "--ffmpeg-location", str(Path(FFMPEG_BIN).parent),
         "--no-part",
-        "-o", str(out_file),
-        url,
     ]
+    # Only pass --ffmpeg-location if path is absolute and directory exists
+    ffmpeg_dir = Path(FFMPEG_BIN).parent
+    if ffmpeg_dir.is_dir() and str(ffmpeg_dir) != ".":
+        cmd.extend(["--ffmpeg-location", str(ffmpeg_dir)])
+
+    cmd.extend(["-o", str(out_file), url])
     run_cmd(cmd)
     
     if not out_file.exists():
@@ -128,81 +194,193 @@ def download_stream_section(url: str, ss: float, dur: float, out_file: Path) -> 
     return out_file
 
 # ─── STEP 2: AUDIO EXTRACTION & TRANSCRIPTION ─────────────────────────────────
-def extract_audio_numpy(video_path: Path):
-    """Decode audio track directly to 16kHz float32 NumPy array, bypassing PyAV bugs."""
-    cmd = [
-        FFMPEG_BIN, "-v", "error",
-        "-i", str(video_path),
-        "-ac", "1", "-ar", "16000", "-f", "f32le", "-"
-    ]
-    raw = subprocess.check_output(cmd)
-    return np.frombuffer(raw, dtype=np.float32)
-
-def transcribe_audio(video_file: Path, censor: bool = True):
-    """Transcribes audio using local Faster-Whisper with word-level timestamps."""
-    from faster_whisper import WhisperModel
-    log("🎙️ Transcribing audio with Faster-Whisper...")
-    model = WhisperModel("base.en", device="cpu", compute_type="int8")
-    audio = extract_audio_numpy(video_file)
-    segments, _ = model.transcribe(audio, word_timestamps=True)
-    
+def transcribe_audio(video_file: Path, ss: float = 0.0, dur: float = None, censor: bool = True, work_dir: Path = None):
+    """
+    Transcribes audio using Faster-Whisper with automatic Whisper-CLI fallback.
+    Always returns word-level timestamps with profanity censoring applied.
+    """
     words_data = []
-    full_transcript = []
-    for seg in segments:
-        full_transcript.append(seg.text)
-        if seg.words:
-            for w in seg.words:
-                raw_w = w.word.strip()
-                processed_w = clean(raw_w) if censor else raw_w
-                words_data.append({"word": processed_w, "start": w.start, "end": w.end})
-                
-    log(f"   Transcribed {len(words_data)} words: '{' '.join(full_transcript)[:80]}...'")
-    return words_data
+
+    # Strategy A: Try Faster-Whisper if available
+    try:
+        from faster_whisper import WhisperModel
+        log("🎙️ Transcribing audio with Faster-Whisper...")
+        
+        # Extract audio chunk
+        wav_path = (work_dir or Path(".tmp")) / "slice_fw.wav"
+        slice_cmd = [FFMPEG_BIN, "-y", "-v", "error"]
+        if ss > 0:
+            slice_cmd.extend(["-ss", f"{ss:.2f}"])
+        if dur:
+            slice_cmd.extend(["-t", f"{dur:.2f}"])
+        slice_cmd.extend(["-i", str(video_file), "-ac", "1", "-ar", "16000", str(wav_path)])
+        run_cmd(slice_cmd)
+
+        model = WhisperModel("base.en", device="cpu", compute_type="int8")
+        segments, _ = model.transcribe(str(wav_path), word_timestamps=True)
+        
+        full_transcript = []
+        for seg in segments:
+            full_transcript.append(seg.text)
+            if seg.words:
+                for w in seg.words:
+                    raw_w = w.word.strip()
+                    processed_w = clean(raw_w) if censor else raw_w
+                    words_data.append({"word": processed_w, "start": w.start, "end": w.end})
+                    
+        log(f"   Transcribed {len(words_data)} words: '{' '.join(full_transcript)[:80]}...'")
+        if wav_path.exists():
+            wav_path.unlink(missing_ok=True)
+        return words_data
+    except Exception as fw_err:
+        log(f"[*] Faster-Whisper note: {fw_err}")
+        log("[*] Using Whisper-CLI engine...")
+
+    # Strategy B: Fallback to Whisper-CLI binary
+    whisper_cli = Path(WHISPER_BIN)
+    whisper_model = get_whisper_cli_model()
+    if whisper_cli.exists() and whisper_model.exists():
+        try:
+            wav_path = (work_dir or Path(".tmp")) / "slice_cli.wav"
+            out_base = (work_dir or Path(".tmp")) / "transcript_cli"
+            
+            slice_cmd = [FFMPEG_BIN, "-y", "-v", "error"]
+            if ss > 0:
+                slice_cmd.extend(["-ss", f"{ss:.2f}"])
+            if dur:
+                slice_cmd.extend(["-t", f"{dur:.2f}"])
+            slice_cmd.extend(["-i", str(video_file), "-ac", "1", "-ar", "16000", str(wav_path)])
+            run_cmd(slice_cmd)
+
+            run_cmd([
+                str(whisper_cli),
+                "-m", str(whisper_model),
+                "-f", str(wav_path),
+                "-ojf", "-of", str(out_base),
+                "-ng", "-ml", "1"
+            ])
+
+            json_file = Path(str(out_base) + ".json")
+            if json_file.exists():
+                with open(json_file, encoding="utf-8") as f:
+                    data = json.load(f)
+                for s in data.get("transcription", []):
+                    t = s.get("text", "").strip()
+                    if not t or re.fullmatch(r"\[.*\]|\(.*\)", t):
+                        continue
+                    if re.fullmatch(r"[^\w]+", t) and words_data:
+                        words_data[-1]["word"] += t
+                        continue
+                    offsets = s.get("offsets", {})
+                    processed_w = clean(t) if censor else t
+                    words_data.append({
+                        "word": processed_w,
+                        "start": offsets.get("from", 0) / 1000.0,
+                        "end": offsets.get("to", 0) / 1000.0
+                    })
+                log(f"   Whisper-CLI transcribed {len(words_data)} tokens.")
+                return words_data
+        except Exception as cli_err:
+            log(f"[*] Whisper-CLI error: {cli_err}")
+
+    # Strategy C: Safe fallback
+    log("[*] Using placeholder dynamic subtitle pace.")
+    return [
+        {"word": "GTA", "start": 0.5, "end": 1.2},
+        {"word": "6", "start": 1.3, "end": 2.0},
+        {"word": "UNREAL", "start": 2.1, "end": 3.0}
+    ]
 
 # ─── STEP 3: GAMER-CHECKUP FACECAM VERIFICATION ───────────────────────────────
+def get_video_duration(video_path: Path) -> float:
+    """Gets total duration in seconds via ffprobe or OpenCV."""
+    try:
+        out = subprocess.check_output(
+            [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration", "-of", "json", str(video_path)],
+            stderr=subprocess.DEVNULL)
+        d = float(json.loads(out)["format"]["duration"])
+        if d > 0:
+            return d
+    except Exception:
+        pass
+    try:
+        import cv2
+        cap = cv2.VideoCapture(str(video_path))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        n_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+        cap.release()
+        if n_frames > 0 and fps > 0:
+            return n_frames / fps
+    except Exception:
+        pass
+    return 60.0
+
 def detect_facecam_box(video_path: Path, src_w: int, src_h: int):
     """
     Gamer-Checkup System:
-    Distinguishes the real streamer (sitting in front of webcam with headphones)
-    from transient in-game game characters or phone feeds.
+    Distinguishes the real seated streamer with headphones from transient
+    in-game characters or UI elements using spatial clustering and stability metrics.
+    Uses FFmpeg pipe sampling to avoid OpenCV .webm seek hangs.
     """
     import cv2
-    if not YUNET_MODEL.exists():
-        log("[!] YuNet face detection model missing; run python setup.py to acquire it.")
-        return None
-        
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        return None
-        
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    detector = cv2.FaceDetectorYN.create(
-        str(YUNET_MODEL), "", (src_w, src_h),
-        score_threshold=0.6, nms_threshold=0.3, top_k=5000)
-        
-    samples = 25
-    step = max(1, total_frames // samples)
+    detector = None
+
+    if YUNET_MODEL.exists():
+        try:
+            detector = cv2.FaceDetectorYN.create(
+                str(YUNET_MODEL), "", (src_w, src_h),
+                score_threshold=0.6, nms_threshold=0.3, top_k=5000)
+        except Exception:
+            detector = None
+
+    haar = None
+    if detector is None:
+        try:
+            haar = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        except Exception:
+            pass
+
+    duration = get_video_duration(video_path)
+    # Sample 6-8 frames evenly across video
+    n_samples = 6
+    timestamps = [max(1.0, (i + 0.5) * (duration / n_samples)) for i in range(n_samples)]
+    
     detections = []
     sampled_count = 0
     
-    for i in range(0, total_frames, step):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-        ret, frame = cap.read()
-        if not ret: break
+    for idx, ts in enumerate(timestamps):
+        frame = None
+        try:
+            cmd = [FFMPEG_BIN, "-y", "-ss", f"{ts:.2f}", "-i", str(video_path),
+                   "-vframes", "1", "-f", "image2", "-vcodec", "mjpeg", "-"]
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            raw, _ = p.communicate()
+            if raw:
+                frame = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+        except Exception:
+            frame = None
+
+        if frame is None:
+            continue
         sampled_count += 1
-        _, faces = detector.detect(frame)
-        if faces is not None:
-            for face in faces:
-                x, y, w, h = map(int, face[:4])
-                score = float(face[-1])
-                detections.append({'x': x, 'y': y, 'w': w, 'h': h, 'frame': i, 'score': score})
-    cap.release()
+        
+        if detector is not None:
+            _, faces = detector.detect(frame)
+            if faces is not None:
+                for face in faces:
+                    x, y, w, h = map(int, face[:4])
+                    score = float(face[-1])
+                    detections.append({'x': x, 'y': y, 'w': w, 'h': h, 'frame': idx, 'score': score})
+        elif haar is not None:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = haar.detectMultiScale(gray, 1.1, 4, minSize=(40, 40))
+            for (x, y, w, h) in faces:
+                detections.append({'x': int(x), 'y': int(y), 'w': int(w), 'h': int(h), 'frame': idx, 'score': 0.8})
     
     if not detections:
         log("[*] Gamer-Checkup: No faces detected in video.")
         return None
 
-    # Spatial clustering (radius = 12% screen width)
     cluster_radius = 0.12 * src_w
     clusters = []
     for d in detections:
@@ -218,7 +396,7 @@ def detect_facecam_box(video_path: Path, src_w: int, src_h: int):
             clusters.append([d])
 
     verified_gamers = []
-    for idx, c in enumerate(clusters):
+    for c in clusters:
         unique_frames = len(set(item['frame'] for item in c))
         persistence   = unique_frames / max(sampled_count, 1)
         med_x         = int(np.median([item['x'] for item in c]))
@@ -228,7 +406,6 @@ def detect_facecam_box(video_path: Path, src_w: int, src_h: int):
         std_x         = float(np.std([item['x'] for item in c]))
         std_y         = float(np.std([item['y'] for item in c]))
 
-        # Edge/Corner proximity check (Streamers are near borders; gameplay action is in center)
         norm_cx = (med_x + med_w / 2.0) / src_w
         norm_cy = (med_y + med_h / 2.0) / src_h
         in_dead_center = (0.35 < norm_cx < 0.65) and (0.28 < norm_cy < 0.72)
@@ -252,7 +429,7 @@ def detect_facecam_box(video_path: Path, src_w: int, src_h: int):
     best = verified_gamers[0]
     log(f"[+] Gamer-Checkup: VERIFIED streamer facecam at ({best['med_x']}, {best['med_y']}) with {best['persistence']*100:.0f}% presence.")
 
-    expand = 2.8   # expand detected face bbox to capture full cam overlay (headphones, shoulders, chair)
+    expand = 2.8
     cam_w  = int(best['med_w'] * expand)
     cam_h  = int(best['med_h'] * expand)
     cam_x  = max(0, best['med_x'] - int(cam_w * 0.35))
@@ -298,7 +475,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 is_last = (j == len(chunk) - 1)
                 if is_last and energy and not word.endswith("!!"):
                     word += "!!"
-                if j == idx:   # active word highlighted in bright yellow
+                if j == idx:   # active word highlighted in bright yellow (#FFDE00 in ASS is &H00DEFF&)
                     parts.append(r"{\c&H00DEFF&}" + word + r"{\c&H00FFFFFF&}")
                 else:
                     parts.append(word)
@@ -311,14 +488,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 # ─── STEP 5: VIDEO COMPOSITING & RENDERING ────────────────────────────────────
 def render_short(raw_cut_path: Path, ass_path: Path, hook_title: str, out_mp4: Path,
-                 facecam_box, src_w: int, src_h: int):
+                 facecam_box, src_w: int, src_h: int, ss: float = 0.0, dur: float = None):
     """
     Renders 1080x1920 vertical format with EBU R128 audio normalization.
     Uses blurred background float styling with verified streamer or single-panel gameplay.
     """
-    ass_esc  = str(ass_path).replace("\\", "/").replace(":", "\\:")
-    font_esc = str(FONT_PATH).replace("\\", "/").replace(":", "\\:")
-    hook     = hook_title.replace("'", "").replace('"', "").upper()
+    ass_esc = str(ass_path.resolve()).replace("\\", "/").replace(":", "\\:")
+    hook    = hook_title.replace("'", "").replace('"', "").upper()
+
+    font_filter = ""
+    if FONT_PATH and FONT_PATH.exists():
+        font_esc = str(FONT_PATH.resolve()).replace("\\", "/").replace(":", "\\:")
+        font_filter = f"fontfile='{font_esc}':"
 
     # Background (Layer 1)
     bg_filter = (
@@ -354,7 +535,7 @@ def render_short(raw_cut_path: Path, ass_path: Path, hook_title: str, out_mp4: P
             "[stacked]"
             f"drawbox=y={SEAM_Y - 2}:color=0xFFDE00@0.6:width=iw:height=4:t=fill,"
             f"drawbox=y={HOOK_BOX_Y}:color=black@0.72:width=iw:height=112:t=fill,"
-            f"drawtext=fontfile='{font_esc}':text='{hook}':fontcolor=white:fontsize=46:"
+            f"drawtext={font_filter}text='{hook}':fontcolor=white:fontsize=46:"
             f"x=(w-text_w)/2:y={HOOK_Y}:shadowcolor=black@0.9:shadowx=3:shadowy=3,"
             f"subtitles='{ass_esc}',"
             f"scale={CANVAS_W}:{CANVAS_H},setsar=1[outv]"
@@ -375,14 +556,19 @@ def render_short(raw_cut_path: Path, ass_path: Path, hook_title: str, out_mp4: P
             f"[bg][content]overlay={CONTENT_X}:{CONTENT_Y}[stacked];"
             "[stacked]"
             f"drawbox=y={single_hook_box_y}:color=black@0.72:width=iw:height=112:t=fill,"
-            f"drawtext=fontfile='{font_esc}':text='{hook}':fontcolor=white:fontsize=46:"
+            f"drawtext={font_filter}text='{hook}':fontcolor=white:fontsize=46:"
             f"x=(w-text_w)/2:y={single_hook_y}:shadowcolor=black@0.9:shadowx=3:shadowy=3,"
             f"subtitles='{ass_esc}',"
             f"scale={CANVAS_W}:{CANVAS_H},setsar=1[outv]"
         )
 
-    cmd = [
-        FFMPEG_BIN, "-y",
+    cmd = [FFMPEG_BIN, "-y"]
+    if ss > 0.0:
+        cmd.extend(["-ss", f"{ss:.3f}"])
+    if dur is not None and dur > 0.0:
+        cmd.extend(["-t", f"{dur:.3f}"])
+
+    cmd.extend([
         "-i", str(raw_cut_path),
         "-filter_complex", filter_complex + ";[0:a]loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[aout]",
         "-map", "[outv]", "-map", "[aout]",
@@ -390,7 +576,7 @@ def render_short(raw_cut_path: Path, ass_path: Path, hook_title: str, out_mp4: P
         "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart",
         str(out_mp4)
-    ]
+    ])
     run_cmd(cmd)
 
 # ─── MAIN PIPELINE ─────────────────────────────────────────────────────────────
@@ -405,9 +591,13 @@ def process_clip(args):
         if args.url:
             src = download_stream_section(args.url, args.ss, args.dur, work_dir / "stream_slice.mp4")
             clip_ss = 0.0
+            clip_dur = args.dur
         elif args.file:
             src = Path(args.file)
+            if not src.exists():
+                raise FileNotFoundError(f"Local video file not found: {src}")
             clip_ss = args.ss
+            clip_dur = args.dur
         else:
             raise ValueError("Either --url or --file must be specified")
 
@@ -415,17 +605,13 @@ def process_clip(args):
         log(f"🎬 Source: {src.name} ({src_w}x{src_h})")
 
         slug = re.sub(r"[^\w\-]+", "_", (args.slug or "gta6_viral_short")).strip("_")
-        out_mp4 = out_dir / f"{slug}.mp4"
-        out_jpg = out_dir / f"{slug}.jpg"
-        out_txt = out_dir / f"{slug}.txt"
+        out_mp4  = out_dir / f"{slug}.mp4"
+        out_jpg  = out_dir / f"{slug}.jpg"
+        out_txt  = out_dir / f"{slug}.txt"
         out_json = out_dir / f"{slug}.json"
 
         # 2. Transcription & Swear Filter
-        words = transcribe_audio(src, censor=not args.no_censor)
-        if not words:
-            words = [{"word": "GTA", "start": 0.5, "end": 1.2},
-                     {"word": "6", "start": 1.3, "end": 2.0},
-                     {"word": "UNREAL", "start": 2.1, "end": 3.0}]
+        words = transcribe_audio(src, ss=clip_ss, dur=clip_dur, censor=not args.no_censor, work_dir=work_dir)
 
         # 3. Gamer-Checkup Facecam Detection
         if args.layout == "blur":
@@ -443,15 +629,17 @@ def process_clip(args):
         # 5. Composite & Render
         log(f"⚡ Rendering 1080x1920 Short to {out_mp4.name}...")
         hook_text = clean(args.hook) if not args.no_censor else args.hook
-        render_short(src, ass_path, hook_text, out_mp4, facecam_box, src_w, src_h)
+        render_short(src, ass_path, hook_text, out_mp4, facecam_box, src_w, src_h, ss=clip_ss, dur=clip_dur)
 
         # 6. Cover Thumbnail & Upload Post Kit
         log("📦 Generating cover thumbnail & upload post kit...")
-        run_cmd([
-            FFMPEG_BIN, "-y", "-loglevel", "error",
-            "-ss", f"{clip_ss + 2.0:.2f}", "-i", str(src),
-            "-vframes", "1", "-update", "1", str(out_jpg)
-        ])
+        thumb_cmd = [FFMPEG_BIN, "-y", "-loglevel", "error"]
+        if clip_ss > 0.0:
+            thumb_cmd.extend(["-ss", f"{clip_ss + 2.0:.2f}"])
+        else:
+            thumb_cmd.extend(["-ss", "2.0"])
+        thumb_cmd.extend(["-i", str(src), "-vframes", "1", "-update", "1", str(out_jpg)])
+        run_cmd(thumb_cmd)
 
         title = hook_text
         tags = "#GTA6 #GTAVI #gaming #gamingclips #shorts #reels #tiktok #viral"
