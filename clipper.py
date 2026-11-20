@@ -488,10 +488,19 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 # ─── STEP 5: VIDEO COMPOSITING & RENDERING ────────────────────────────────────
 def render_short(raw_cut_path: Path, ass_path: Path, hook_title: str, out_mp4: Path,
-                 facecam_box, src_w: int, src_h: int, ss: float = 0.0, dur: float = None):
+                 facecam_box, src_w: int, src_h: int, ss: float = 0.0, dur: float = None,
+                 crop_bottom: float = 0.10, enhance_facecam: bool = True):
     """
     Renders 1080x1920 vertical format with EBU R128 audio normalization.
     Uses blurred background float styling with verified streamer or single-panel gameplay.
+
+    Args:
+        crop_bottom:     Fraction (0.0–0.5) of gameplay frame height to crop from the bottom
+                         before scaling. Used to remove the stream's native subtitle bar which
+                         may contain uncensored profanity. Default 0.10 = bottom 10%.
+        enhance_facecam: Apply FFmpeg enhancement chain to the facecam panel:
+                         hqdn3d denoise → unsharp sharpen → eq colour/contrast boost.
+                         Runs at encode speed (CPU), zero extra install. Default True.
     """
     ass_esc = str(ass_path.resolve()).replace("\\", "/").replace(":", "\\:")
     hook    = hook_title.replace("'", "").replace('"', "").upper()
@@ -500,6 +509,48 @@ def render_short(raw_cut_path: Path, ass_path: Path, hook_title: str, out_mp4: P
     if FONT_PATH and FONT_PATH.exists():
         font_esc = str(FONT_PATH.resolve()).replace("\\", "/").replace(":", "\\:")
         font_filter = f"fontfile='{font_esc}':"
+
+    # ── Facecam enhancement chain (applied to streamer panel only) ──────────────
+    # hqdn3d  : temporal + spatial denoise — kills stream compression blocking/noise
+    # unsharp : edge-sharpening (5×5 luma 0.8, 3×3 chroma 0.4) — restores detail
+    # eq      : slight brightness lift (+0.03), contrast boost (1.08×), saturation (1.15×)
+    # scale   : lanczos interpolation — highest quality upscale vs default bilinear
+    _fc_enhance = (
+        "hqdn3d=luma_spatial=2:chroma_spatial=1.5:luma_tmp=3:chroma_tmp=2.5,"
+        "unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.8"
+        ":chroma_msize_x=3:chroma_msize_y=3:chroma_amount=0.4,"
+        "eq=brightness=0.03:contrast=1.08:saturation=1.15,"
+    ) if enhance_facecam else ""
+
+    # ── Caption-crop helpers ─────────────────────────────────────────────────────
+    # crop_bottom removes the native in-stream subtitle bar from gameplay footage
+    # so our own karaoke subs (swear-censored) are the only text visible.
+    crop_bottom = max(0.0, min(crop_bottom, 0.49))
+
+    def _gp_crop_filter(src_label: str, out_label: str, target_h: int) -> str:
+        """
+        Scale gameplay source so its visible height (after bottom-crop) fills target_h,
+        then crop width to CONTENT_W.  The bottom crop_bottom fraction is excluded.
+        """
+        if crop_bottom > 0.0:
+            # 1. Crop off the bottom subtitle bar first (keeps aspect ratio intact)
+            # crop=iw : ih*(1-crop_bottom) : 0 : 0
+            crop_frac = 1.0 - crop_bottom
+            # scale so the cropped portion fills the panel height
+            return (
+                f"[{src_label}]"
+                f"crop=iw:trunc(ih*{crop_frac:.4f}/2)*2:0:0,"
+                f"scale=-2:{target_h}:flags=lanczos,"
+                f"crop={CONTENT_W}:{target_h}:max(0\\,(iw-{CONTENT_W})/2):0"
+                f"[{out_label}]"
+            )
+        else:
+            return (
+                f"[{src_label}]"
+                f"scale=-2:{target_h}:flags=lanczos,"
+                f"crop={CONTENT_W}:{target_h}:max(0\\,(iw-{CONTENT_W})/2):0"
+                f"[{out_label}]"
+            )
 
     # Background (Layer 1)
     bg_filter = (
@@ -514,16 +565,12 @@ def render_short(raw_cut_path: Path, ass_path: Path, hook_title: str, out_mp4: P
     if facecam_box:
         # 2-Panel Layout: Gameplay Top (60%) + Verified Streamer Bottom (40%)
         fx, fy, fw, fh = facecam_box
-        gp_filter = (
-            "[src_gp]"
-            f"scale=-2:{CONTENT_TOP_H},"
-            f"crop={CONTENT_W}:{CONTENT_TOP_H}:max(0\\,(iw-{CONTENT_W})/2):0"
-            "[gp]"
-        )
+        gp_filter = _gp_crop_filter("src_gp", "gp", CONTENT_TOP_H)
         fc_filter = (
             "[src_fc]"
             f"crop={fw}:{fh}:{fx}:{fy},"
-            f"scale={CONTENT_W}:{CONTENT_BOT_H}:force_original_aspect_ratio=increase,"
+            f"{_fc_enhance}"
+            f"scale={CONTENT_W}:{CONTENT_BOT_H}:force_original_aspect_ratio=increase:flags=lanczos,"
             f"crop={CONTENT_W}:{CONTENT_BOT_H}"
             "[fc]"
         )
@@ -542,12 +589,7 @@ def render_short(raw_cut_path: Path, ass_path: Path, hook_title: str, out_mp4: P
         )
     else:
         # Single-Panel Pure Gameplay Layout
-        gp_filter = (
-            "[src_gp]"
-            f"scale=-2:{CONTENT_H},"
-            f"crop={CONTENT_W}:{CONTENT_H}:max(0\\,(iw-{CONTENT_W})/2):0"
-            "[content]"
-        )
+        gp_filter = _gp_crop_filter("src_gp", "content", CONTENT_H)
         single_hook_y = CONTENT_Y + 140
         single_hook_box_y = single_hook_y - 42
         filter_complex = (
@@ -572,7 +614,7 @@ def render_short(raw_cut_path: Path, ass_path: Path, hook_title: str, out_mp4: P
         "-i", str(raw_cut_path),
         "-filter_complex", filter_complex + ";[0:a]loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[aout]",
         "-map", "[outv]", "-map", "[aout]",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-c:v", "libx264", "-preset", "slow", "-crf", "18",
         "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart",
         str(out_mp4)
@@ -629,7 +671,12 @@ def process_clip(args):
         # 5. Composite & Render
         log(f"⚡ Rendering 1080x1920 Short to {out_mp4.name}...")
         hook_text = clean(args.hook) if not args.no_censor else args.hook
-        render_short(src, ass_path, hook_text, out_mp4, facecam_box, src_w, src_h, ss=clip_ss, dur=clip_dur)
+        render_short(
+            src, ass_path, hook_text, out_mp4, facecam_box, src_w, src_h,
+            ss=clip_ss, dur=clip_dur,
+            crop_bottom=args.crop_bottom,
+            enhance_facecam=not args.no_enhance,
+        )
 
         # 6. Cover Thumbnail & Upload Post Kit
         log("📦 Generating cover thumbnail & upload post kit...")
@@ -691,6 +738,12 @@ if __name__ == "__main__":
     parser.add_argument("--caption", help="Social post caption")
     parser.add_argument("--layout", choices=["auto", "facecam", "blur"], default="auto",
                         help="Layout: 'auto' (detects gamer cam), 'facecam' (force split), 'blur' (single gameplay)")
+    parser.add_argument("--crop_bottom", type=float, default=0.10,
+                        help="Fraction of gameplay frame to crop from bottom (removes native subtitle bar). "
+                             "Default 0.10 = bottom 10%%. Set 0 to disable.")
+    parser.add_argument("--no_enhance", action="store_true",
+                        help="Disable facecam enhancement (hqdn3d + unsharp + eq). "
+                             "Use if streamer footage is already high quality.")
     parser.add_argument("--no-censor", action="store_true", help="Disable swear word censoring")
     parser.add_argument("--output", help="Custom output directory")
     
