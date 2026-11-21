@@ -76,6 +76,12 @@ FFPROBE_BIN = find_binary("ffprobe")
 WHISPER_BIN = find_binary("whisper-cli")
 YUNET_MODEL = SCRIPT_DIR / "models" / "face_detection_yunet_2023mar.onnx"
 
+# Ensure FFmpeg directory is in system PATH for child processes & whisper
+if Path(FFMPEG_BIN).exists():
+    _ffmpeg_dir = str(Path(FFMPEG_BIN).parent.resolve())
+    if _ffmpeg_dir not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = _ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+
 def get_whisper_cli_model() -> Path:
     candidates = [
         SCRIPT_DIR / "models" / "ggml-small.en.bin",
@@ -92,14 +98,14 @@ CANVAS_W      = 1080
 CANVAS_H      = 1920
 CONTENT_W     = 1040
 CONTENT_X     = (CANVAS_W - CONTENT_W) // 2   # = 20
-CONTENT_TOP_H = 960                           # Gameplay panel height
-CONTENT_BOT_H = 640                           # Facecam panel height
+CONTENT_TOP_H = 1080                          # Streamer/YouTuber panel height (~70% of active content)
+CONTENT_BOT_H = 520                           # Gameplay panel height (~30% of active content)
 CONTENT_H     = CONTENT_TOP_H + CONTENT_BOT_H # = 1600
 CONTENT_Y     = (CANVAS_H - CONTENT_H) // 2   # = 160
-SEAM_Y        = CONTENT_Y + CONTENT_TOP_H     # = 1120
-HOOK_Y        = CONTENT_Y + 180               # = 340
-HOOK_BOX_Y    = HOOK_Y - 42
-SUB_SEAM_Y    = SEAM_Y - 12                   # = 1108
+SEAM_Y        = CONTENT_Y + CONTENT_TOP_H     # = 1240 (Under top video, above gameplay cut)
+ARTICLE_Y     = SEAM_Y                        # Center of interactive article headline card
+ARTICLE_BOX_Y = ARTICLE_Y - 48
+SUB_SEAM_Y    = CONTENT_Y + CONTENT_H - 180   # = 1580 (Inside bottom gameplay area)
 SUB_SINGLE_Y  = CONTENT_Y + CONTENT_H - 220  # = 1540
 
 # ─── FONT SELECTION ───────────────────────────────────────────────────────────
@@ -283,7 +289,45 @@ def transcribe_audio(video_file: Path, ss: float = 0.0, dur: float = None, censo
         except Exception as cli_err:
             log(f"[*] Whisper-CLI error: {cli_err}")
 
-    # Strategy C: Safe fallback
+    # Strategy C: OpenAI Whisper (standard Python package)
+    try:
+        import whisper
+        log("🎙️ Transcribing audio with OpenAI Whisper...")
+        wav_path = (work_dir or Path(".tmp")) / "slice_pywhisper.wav"
+        wav_path.parent.mkdir(parents=True, exist_ok=True)
+        slice_cmd = [FFMPEG_BIN, "-y", "-v", "error"]
+        if ss > 0:
+            slice_cmd.extend(["-ss", f"{ss:.2f}"])
+        if dur:
+            slice_cmd.extend(["-t", f"{dur:.2f}"])
+        slice_cmd.extend(["-i", str(video_file), "-ac", "1", "-ar", "16000", str(wav_path)])
+        run_cmd(slice_cmd)
+
+        py_model = whisper.load_model("base.en")
+        w_res = py_model.transcribe(str(wav_path), word_timestamps=True)
+        full_transcript = []
+        for seg in w_res.get("segments", []):
+            full_transcript.append(seg.get("text", ""))
+            for w in seg.get("words", []):
+                raw_w = w.get("word", "").strip()
+                if not raw_w:
+                    continue
+                processed_w = clean(raw_w) if censor else raw_w
+                words_data.append({
+                    "word": processed_w,
+                    "start": float(w.get("start", 0.0)),
+                    "end": float(w.get("end", 0.0))
+                })
+
+        log(f"   OpenAI Whisper transcribed {len(words_data)} words: '{' '.join(full_transcript)[:80]}...'")
+        if wav_path.exists():
+            wav_path.unlink(missing_ok=True)
+        if words_data:
+            return words_data
+    except Exception as pyw_err:
+        log(f"[*] OpenAI-Whisper error: {pyw_err}")
+
+    # Strategy D: Safe fallback
     log("[*] Using placeholder dynamic subtitle pace.")
     return [
         {"word": "GTA", "start": 0.5, "end": 1.2},
@@ -429,13 +473,13 @@ def detect_facecam_box(video_path: Path, src_w: int, src_h: int):
     best = verified_gamers[0]
     log(f"[+] Gamer-Checkup: VERIFIED streamer facecam at ({best['med_x']}, {best['med_y']}) with {best['persistence']*100:.0f}% presence.")
 
-    expand = 2.8
-    cam_w  = int(best['med_w'] * expand)
-    cam_h  = int(best['med_h'] * expand)
-    cam_x  = max(0, best['med_x'] - int(cam_w * 0.35))
-    cam_y  = max(0, best['med_y'] - int(cam_h * 0.25))
-    cam_w  = min(src_w - cam_x, cam_w)
-    cam_h  = min(src_h - cam_y, cam_h)
+    expand = 5.2
+    target_w = max(int(best['med_w'] * expand), int(src_w * 0.35))
+    target_h = int(target_w * (9.0 / 16.0))
+    cam_x = max(0, min(src_w - target_w, best['med_x'] + best['med_w'] // 2 - target_w // 2))
+    cam_y = max(0, min(src_h - target_h, best['med_y'] + best['med_h'] // 2 - int(target_h * 0.45)))
+    cam_w = min(src_w - cam_x, target_w)
+    cam_h = min(src_h - cam_y, target_h)
     return cam_x, cam_y, cam_w, cam_h
 
 # ─── STEP 4: GENERATE ASS SABS SUBTITLES ──────────────────────────────────────
@@ -510,47 +554,38 @@ def render_short(raw_cut_path: Path, ass_path: Path, hook_title: str, out_mp4: P
         font_esc = str(FONT_PATH.resolve()).replace("\\", "/").replace(":", "\\:")
         font_filter = f"fontfile='{font_esc}':"
 
-    # ── Facecam enhancement chain (applied to streamer panel only) ──────────────
-    # hqdn3d  : temporal + spatial denoise — kills stream compression blocking/noise
-    # unsharp : edge-sharpening (5×5 luma 0.8, 3×3 chroma 0.4) — restores detail
-    # eq      : slight brightness lift (+0.03), contrast boost (1.08×), saturation (1.15×)
-    # scale   : lanczos interpolation — highest quality upscale vs default bilinear
+    # ── High-End Facecam Upscaler & Enhancement Chain ─────────────────────────
+    # 1. hqdn3d  : temporal + spatial denoise — removes compression noise & blockiness
+    # 2. cas     : AMD FidelityFX Contrast Adaptive Sharpening — restores crisp detail
+    # 3. unsharp : edge-sharpening (7x7 luma 1.2, 5x5 chroma 0.6) — sharpens face & textures
+    # 4. eq      : brightness (+0.04), contrast (1.12x), saturation (1.20x) — removes blandness
     _fc_enhance = (
-        "hqdn3d=luma_spatial=2:chroma_spatial=1.5:luma_tmp=3:chroma_tmp=2.5,"
-        "unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.8"
-        ":chroma_msize_x=3:chroma_msize_y=3:chroma_amount=0.4,"
-        "eq=brightness=0.03:contrast=1.08:saturation=1.15,"
+        "hqdn3d=luma_spatial=3.0:chroma_spatial=2.0:luma_tmp=4.0:chroma_tmp=3.0,"
+        "cas=strength=0.8,"
+        "unsharp=luma_msize_x=7:luma_msize_y=7:luma_amount=1.2"
+        ":chroma_msize_x=5:chroma_msize_y=5:chroma_amount=0.6,"
+        "eq=brightness=0.04:contrast=1.12:saturation=1.20,"
     ) if enhance_facecam else ""
 
-    # ── Caption-crop helpers ─────────────────────────────────────────────────────
-    # crop_bottom removes the native in-stream subtitle bar from gameplay footage
-    # so our own karaoke subs (swear-censored) are the only text visible.
+    # ── Caption-crop & Gamer-Exclusion helpers ─────────────────────────────────
+    # crop_bottom removes the native in-stream subtitle bar from gameplay footage.
+    # We also crop the left portion of the 16:9 gameplay screen to guarantee the
+    # streamer's camera overlay (top-right of stream) is NOT duplicated at the bottom.
     crop_bottom = max(0.0, min(crop_bottom, 0.49))
 
     def _gp_crop_filter(src_label: str, out_label: str, target_h: int) -> str:
         """
-        Scale gameplay source so its visible height (after bottom-crop) fills target_h,
-        then crop width to CONTENT_W.  The bottom crop_bottom fraction is excluded.
+        Crops gameplay so streamer overlay in top-right is excluded and bottom subtitle
+        bar is excluded, then scales cleanly to target_h x CONTENT_W.
         """
-        if crop_bottom > 0.0:
-            # 1. Crop off the bottom subtitle bar first (keeps aspect ratio intact)
-            # crop=iw : ih*(1-crop_bottom) : 0 : 0
-            crop_frac = 1.0 - crop_bottom
-            # scale so the cropped portion fills the panel height
-            return (
-                f"[{src_label}]"
-                f"crop=iw:trunc(ih*{crop_frac:.4f}/2)*2:0:0,"
-                f"scale=-2:{target_h}:flags=lanczos,"
-                f"crop={CONTENT_W}:{target_h}:max(0\\,(iw-{CONTENT_W})/2):0"
-                f"[{out_label}]"
-            )
-        else:
-            return (
-                f"[{src_label}]"
-                f"scale=-2:{target_h}:flags=lanczos,"
-                f"crop={CONTENT_W}:{target_h}:max(0\\,(iw-{CONTENT_W})/2):0"
-                f"[{out_label}]"
-            )
+        crop_frac = 1.0 - crop_bottom
+        return (
+            f"[{src_label}]"
+            f"crop=trunc(iw*0.64/2)*2:trunc(ih*{crop_frac:.4f}/2)*2:0:0,"
+            f"scale={CONTENT_W}:{target_h}:flags=lanczos,"
+            f"crop={CONTENT_W}:{target_h}"
+            f"[{out_label}]"
+        )
 
     # Background (Layer 1)
     bg_filter = (
@@ -563,27 +598,34 @@ def render_short(raw_cut_path: Path, ass_path: Path, hook_title: str, out_mp4: P
     )
 
     if facecam_box:
-        # 2-Panel Layout: Gameplay Top (60%) + Verified Streamer Bottom (40%)
+        # 2-Panel Layout:
+        # TOP (70%): Streamer/YouTuber upscaled & enhanced
+        # BOTTOM (30%): Clean gameplay with streamer & native captions cropped out
         fx, fy, fw, fh = facecam_box
-        gp_filter = _gp_crop_filter("src_gp", "gp", CONTENT_TOP_H)
         fc_filter = (
             "[src_fc]"
             f"crop={fw}:{fh}:{fx}:{fy},"
             f"{_fc_enhance}"
-            f"scale={CONTENT_W}:{CONTENT_BOT_H}:force_original_aspect_ratio=increase:flags=lanczos,"
-            f"crop={CONTENT_W}:{CONTENT_BOT_H}"
+            f"scale={CONTENT_W}:{CONTENT_TOP_H}:force_original_aspect_ratio=increase:flags=lanczos,"
+            f"crop={CONTENT_W}:{CONTENT_TOP_H}"
             "[fc]"
         )
+        gp_filter = _gp_crop_filter("src_gp", "gp", CONTENT_BOT_H)
+
         filter_complex = (
             "[0:v]split=3[src_bg][src_gp][src_fc];"
-            f"{bg_filter};{gp_filter};{fc_filter};"
-            "[gp][fc]vstack=inputs=2[content];"
+            f"{bg_filter};{fc_filter};{gp_filter};"
+            "[fc][gp]vstack=inputs=2[content];"
             f"[bg][content]overlay={CONTENT_X}:{CONTENT_Y}[stacked];"
             "[stacked]"
-            f"drawbox=y={SEAM_Y - 2}:color=0xFFDE00@0.6:width=iw:height=4:t=fill,"
-            f"drawbox=y={HOOK_BOX_Y}:color=black@0.72:width=iw:height=112:t=fill,"
-            f"drawtext={font_filter}text='{hook}':fontcolor=white:fontsize=46:"
-            f"x=(w-text_w)/2:y={HOOK_Y}:shadowcolor=black@0.9:shadowx=3:shadowy=3,"
+            # Interactive Article Card right under the top YouTuber video (at seam)
+            f"drawbox=y={ARTICLE_BOX_Y}:color=black@0.85:width=iw:height=96:t=fill,"
+            f"drawbox=y={ARTICLE_BOX_Y}:color=0xFFDE00@0.9:width=iw:height=3:t=fill,"
+            f"drawbox=y={ARTICLE_BOX_Y + 93}:color=0xFFDE00@0.9:width=iw:height=3:t=fill,"
+            f"drawtext={font_filter}text='VICE CITY TIMES  *  BREAKING REPORT':fontcolor=0xFFDE00:fontsize=22:"
+            f"x=(w-text_w)/2:y={ARTICLE_Y - 38},"
+            f"drawtext={font_filter}text='{hook}':fontcolor=white:fontsize=42:"
+            f"x=(w-text_w)/2:y={ARTICLE_Y - 10}:shadowcolor=black@0.9:shadowx=2:shadowy=2,"
             f"subtitles='{ass_esc}',"
             f"scale={CANVAS_W}:{CANVAS_H},setsar=1[outv]"
         )
